@@ -68,5 +68,14 @@ These were written as part of projects that received funding from:
 * Invest Northern Ireland (RDO0712612)
 * Cancer Research UK Accelerator (C11512/A20256)
 
+##Morphle
+
+* build to create jar file, and use the jar file in qupath-morphle repo to run the driver
+* requires java 21 installed
+* java 21 installation --> sudo apt install openjdk-21-jdk -y
+* build command --> ./gradlew -Dorg.gradle.java.home=/usr/lib/jvm/java-1.21.0-openjdk-amd64/ clean jpackage
+* jar location --> qupath-app/build/libs/, qupath-core/build/libs/, qupath-core-proccessing/build/libs/ 3 jar files from 3 locations, copy them to the driver
+* while copying files rename them to qupath-app.jar, qupath-core.jar, qupath-core-processing.jar
+
 
 ![Image](https://raw.githubusercontent.com/wiki/qupath/qupath/images/qupath_demo.jpg)

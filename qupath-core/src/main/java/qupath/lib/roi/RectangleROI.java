@@ -49,7 +49,7 @@ public class RectangleROI extends AbstractPathBoundedROI implements Serializable
 		super();
 	}
 
-	RectangleROI(double x, double y, double width, double height) {
+	public RectangleROI(double x, double y, double width, double height) {
 		this(x, y, width, height, null);
 	}
 

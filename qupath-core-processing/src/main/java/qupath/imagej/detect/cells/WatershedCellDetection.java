@@ -52,6 +52,13 @@ import ij.measure.Measurements;
 import ij.plugin.ContrastEnhancer;
 import ij.plugin.filter.EDM;
 import ij.plugin.filter.RankFilters;
+import qupath.lib.images.servers.ImageServerProvider;
+import qupath.imagej.detect.cells.PositiveCellDetection;
+import qupath.lib.roi.RectangleROI;
+import qupath.lib.objects.classes.PathClassFactory;
+import qupath.lib.analysis.algorithms.EstimateStainVectors;
+import qupath.lib.roi.ROIs;
+import qupath.lib.plugins.parameters.MorphleParameterList;
 import ij.process.Blitter;
 import ij.process.ByteProcessor;
 import ij.process.ColorProcessor;
@@ -174,7 +181,7 @@ public class WatershedCellDetection extends AbstractTileableDetectionPlugin<Buff
 	ParameterList params;
 	
 	
-	static class CellDetector implements ObjectDetector<BufferedImage> {
+	public static class CellDetector implements ObjectDetector<BufferedImage> {
 	
 		private String lastServerPath = null;
 		//private PathImage<ImagePlus> pathImage; // Caching these cause out of memory errors...
@@ -199,6 +206,364 @@ public class WatershedCellDetection extends AbstractTileableDetectionPlugin<Buff
 				return requestedPixelSize;
 			}
 			return Double.NaN;
+		}
+
+		public static double getMorphlePreferredPixelSizeMicrons(double pixelSize, ParameterList params) {
+			double requestedPixelSize = params.getDoubleParameterValue("requestedPixelSizeMicrons");
+			double averagedPixelSize = pixelSize;
+			if (requestedPixelSize < 0)
+				requestedPixelSize = averagedPixelSize * (-requestedPixelSize);
+			requestedPixelSize = Math.max(requestedPixelSize, averagedPixelSize);
+			return requestedPixelSize;
+		}
+
+		static int MAX_PIXELS = 4000*4000;
+
+		private static RegionRequest getRegionRequest(ImageData<BufferedImage> imageData) {
+			PathObject pathObject = imageData.getHierarchy().getSelectionModel().getSelectedObject();
+			ROI roi = pathObject == null ? null : pathObject.getROI();
+			if (roi == null)
+				roi = ROIs.createRectangleROI(0, 0, imageData.getServer().getWidth(), imageData.getServer().getHeight(), ImagePlane.getDefaultPlane());
+
+			double downsample = Math.max(1, Math.sqrt((roi.getBoundsWidth() * roi.getBoundsHeight()) / MAX_PIXELS));
+			return RegionRequest.createInstance(imageData.getServerPath(), downsample, roi);
+		}
+
+		private static void autoResetStains(ImageData<BufferedImage> imageData, ParameterList params) {
+
+			// Create auto detection parameters
+			params
+					.addDoubleParameter("minStainOD", "Min channel OD", 0.05, "", "Minimum staining OD - pixels with a lower OD in any channel (RGB) are ignored (default = 0.05)")
+					.addDoubleParameter("maxStainOD", "Max total OD", 1., "", "Maximum staining OD - more densely stained pixels are ignored (default = 1)")
+					.addDoubleParameter("ignorePercentage", "Ignore extrema", 1., "%", "Percentage of extreme pixels to ignore, to improve robustness in the presence of noise/other artefacts (default = 1)")
+					.addBooleanParameter("checkColors", "Exclude unrecognised colors (H&E only)", false, "Exclude unexpected colors (e.g. green) that are likely to be caused by artefacts and not true staining");
+//				.addDoubleParameter("ignorePercentage", "Ignore extrema", 1., "%", 0, 20, "Percentage of extreme pixels to ignore, to improve robustness in the presence of noise/other artefacts");
+
+			ColorDeconvolutionStains _stains = imageData.getColorDeconvolutionStains();
+			BufferedImage img = null;
+
+			RegionRequest request = getRegionRequest(imageData);
+			try {
+				img = imageData.getServer().readRegion(request);
+			} catch (IOException e) {
+				logger.error("Unable to obtain pixels for " + request.toString(), e);
+			}
+
+			// Apply small amount of smoothing to reduce compression artefacts
+			img = EstimateStainVectors.smoothImage(img);
+
+			double minOD = params.getDoubleParameterValue("minStainOD");
+			double maxOD = params.getDoubleParameterValue("maxStainOD");
+			double ignore = params.getDoubleParameterValue("ignorePercentage");
+
+//			StainsWrapper stainsWrapper = new StainsWrapper(stains);
+
+			boolean checkColors = params.getBooleanParameterValue("checkColors") && _stains.isH_E(); // Only accept if H&E
+			ignore = Math.max(0, Math.min(ignore, 100));
+//				ColorDeconvolutionStains stains = estimateStains(imgFinal, stainsWrapper.getStains(), minOD, maxOD, ignore);
+			try {
+				ColorDeconvolutionStains stainsNew = EstimateStainVectors.estimateStains(img, _stains, minOD, maxOD, ignore, checkColors);
+				imageData.setColorDeconvolutionStains(stainsNew);
+			} catch (Exception e2) {
+//				DisplayHelpers.showErrorMessage("Estimate stain vectors", e2);
+				throw e2;
+			}
+		}
+
+		private static ParameterList setupParameters(ImageData<BufferedImage> imageData, MorphleParameterList inputParameterList) {
+			ParameterList params = new ParameterList();
+			params.addEmptyParameter("Setup parameters");
+
+			// Use the inputParameterList to set parameters if present
+			params.addChoiceParameter(
+					"detectionImage",
+					"Detection channel",
+					inputParameterList.getDetectionImage(),
+					Arrays.asList("Red", "Green", "Blue"),
+					"Choose the channel that should be used for nucleus detection (e.g. DAPI)"
+			);
+
+			params.addChoiceParameter(
+					"detectionImageBrightfield",
+					"Detection image",
+					inputParameterList.getDetectionImageBrightfield(),
+					Arrays.asList("Hematoxylin OD", "Optical density sum"),
+					"Transformed image to which to apply the detection"
+			);
+
+			params.addDoubleParameter(
+					"requestedPixelSizeMicrons",
+					"Requested pixel size",
+					inputParameterList.getRequestedPixelSizeMicrons(),
+					"µm",
+					"Choose pixel size at which detection will be performed - higher values are likely to be faster, but may be less accurate; set <= 0 to use the full image resolution"
+			);
+
+			params.addDoubleParameter(
+					"backgroundRadiusMicrons",
+					"backgroundRadiusMicrons",
+					inputParameterList.getBackgroundRadiusMicrons()
+			);
+
+			params.addDoubleParameter(
+					"medianRadiusMicrons",
+					"medianRadiusMicrons",
+					inputParameterList.getMedianRadiusMicrons()
+			);
+
+			params.addDoubleParameter(
+					"sigmaMicrons",
+					"sigmaMicrons",
+					inputParameterList.getSigmaMicrons()
+			);
+
+			params.addDoubleParameter(
+					"minAreaMicrons",
+					"minAreaMicrons",
+					inputParameterList.getMinAreaMicrons()
+			);
+
+			params.addDoubleParameter(
+					"maxAreaMicrons",
+					"maxAreaMicrons",
+					inputParameterList.getMaxAreaMicrons()
+			);
+
+			params.addDoubleParameter(
+					"threshold",
+					"threshold",
+					inputParameterList.getThreshold()
+			);
+
+			params.addDoubleParameter(
+					"maxBackground",
+					"maxBackground",
+					inputParameterList.getMaxBackground()
+			);
+
+			params.addBooleanParameter(
+					"watershedPostProcess",
+					"watershedPostProcess",
+					inputParameterList.isWatershedPostProcess()
+			);
+
+			params.addBooleanParameter(
+					"excludeDAB",
+					"excludeDAB",
+					inputParameterList.isExcludeDAB()
+			);
+
+			params.addDoubleParameter(
+					"cellExpansionMicrons",
+					"cellExpansionMicrons",
+					inputParameterList.getCellExpansionMicrons(),
+					"µm",
+					"cellExpansionMicrons"
+			);
+
+			params.addBooleanParameter(
+					"includeNuclei",
+					"includeNuclei",
+					inputParameterList.isIncludeNuclei()
+			);
+
+			params.addBooleanParameter(
+					"smoothBoundaries",
+					"smoothBoundaries",
+					inputParameterList.isSmoothBoundaries()
+			);
+
+			params.addBooleanParameter(
+					"makeMeasurements",
+					"makeMeasurements",
+					inputParameterList.isMakeMeasurements()
+			);
+
+//			PositiveCellDetection.addExraParams(params, imageData);
+			params.addChoiceParameter("thresholdCompartment", "Score compartment", inputParameterList.getThresholdCompartment(),
+					Arrays.asList("Nucleus: DAB OD mean", "Nucleus: DAB OD max",
+							"Cytoplasm: DAB OD mean", "Cytoplasm: DAB OD max",
+							"Cell: DAB OD mean", "Cell: DAB OD max"));
+			params.addDoubleParameter("thresholdPositive1", "Threshold 1+", inputParameterList.getThresholdPositive1(), "", "Low positive intensity threshold");
+			params.addDoubleParameter("thresholdPositive2", "Threshold 2+", inputParameterList.getThresholdPositive2(), "", "Moderate positive intensity threshold");
+			params.addDoubleParameter("thresholdPositive3", "Threshold 3+", inputParameterList.getThresholdPositive3(), "", "High positive intensity threshold");
+			params.addBooleanParameter("singleThreshold", "Single threshold", inputParameterList.isSingleThreshold());
+
+			params.addBooleanParameter(
+					"backgroundByReconstruction",
+					"backgroundByReconstruction",
+					inputParameterList.isBackgroundByReconstruction()
+			);
+
+			return params;
+		}
+
+
+		public static Collection<PathObject> morphleRunDetectionParameterized(String imgPath, MorphleParameterList parameterList, double pixelSize) throws IOException {
+			ImageServer<BufferedImage> _server = ImageServerProvider.buildServer(imgPath, BufferedImage.class);
+			ImageData<BufferedImage> imageData = new ImageData<>(_server);
+			imageData.setImageType(ImageData.ImageType.BRIGHTFIELD_H_DAB);
+
+			ParameterList params = setupParameters(imageData, parameterList);
+
+			ROI pathROI = new RectangleROI(
+					0.0,
+					0.0,
+					(double) imageData.getServer().getWidth(),
+					(double) imageData.getServer().getHeight()
+			);
+
+//			autoResetStains(imageData, params);
+
+			PathImage<ImagePlus> pathImage;
+			ImageServer<BufferedImage> server = imageData.getServer();
+			double downsample = ServerTools.getDownsampleFactor(server, getMorphlePreferredPixelSizeMicrons(pixelSize, params));
+			pathImage = IJTools.convertToImagePlus(server, RegionRequest.createInstance(server.getPath(), downsample, pathROI));
+
+			logger.trace("Cell detection with downsample: {}", pathImage.getDownsampleFactor());
+
+			// Create a detector if we don't already have one for this image
+			boolean isBrightfield = true;
+			ImageProcessor ip = pathImage.getImage().getProcessor();
+			FloatProcessor fpDetection = null;
+			ColorDeconvolutionStains stains = imageData.getColorDeconvolutionStains();
+			Map<String, FloatProcessor> channels = new LinkedHashMap<>();
+			Map<String, FloatProcessor> channelsCell = new LinkedHashMap<>();
+			Roi roi = IJTools.convertToIJRoi(pathROI, pathImage);
+			if (ip instanceof ColorProcessor && stains != null && isBrightfield) {
+				FloatProcessor[] fps = IJTools.colorDeconvolve((ColorProcessor)ip, stains);
+				for (int i = 0; i < 3; i++) {
+					StainVector stain = stains.getStain(i+1);
+					if (!stain.isResidual()) {
+						channels.put(stain.getName() + " OD", fps[i]);
+						channelsCell.put(stain.getName() + " OD", fps[i]);
+					}
+				}
+
+
+				if (!params.getParameters().get("detectionImageBrightfield").isHidden()) {
+					String stainChoice = (String)params.getChoiceParameterValue("detectionImageBrightfield");
+					if (stainChoice.equals(IMAGE_OPTICAL_DENSITY)) {
+						fpDetection = IJTools.convertToOpticalDensitySum((ColorProcessor)ip, stains.getMaxRed(), stains.getMaxGreen(), stains.getMaxBlue());
+					} else if (stainChoice.equals(IMAGE_HEMATOXYLIN)) {
+						for (int i = 0; i < 3; i++) {
+							// This gives some tolerance to different spellings
+							if (ColorDeconvolutionStains.isHematoxylin(stains.getStain(i+1))) {
+								fpDetection = (FloatProcessor)fps[i].duplicate();
+								if (i > 0)
+									logger.warn("Hematoxylin expected to be stain 1, but here it is stain {}", i+1);
+							}
+						}
+						if (fpDetection == null) {
+							logger.warn("Hematoxylin stain not found! The first stain will be used by default ({}).", stains.getStain(1).getName());
+							fpDetection = (FloatProcessor)fps[0].duplicate();
+						}
+					} else {
+						// Try to get the stain choice from the available stains
+						// (Note that currently the choices are restricted by the ParameterList, so this cannot easily be called)
+						for (int i = 0; i < 3; i++) {
+							String currentStainName = stains.getStain(i+1).getName();
+							if (stainChoice.equals(currentStainName) || stainChoice.equals(currentStainName + " OD")) {
+								fpDetection = (FloatProcessor)fps[i].duplicate();
+								logger.warn("Using stain {} for cell detection", currentStainName);
+							}
+						}
+						if (fpDetection == null) {
+							logger.warn("Unknown detection channel {}, I will use the first stain", stainChoice);
+							fpDetection = (FloatProcessor)fps[0].duplicate();
+						}
+					}
+				}
+
+			}
+			if (fpDetection == null) {
+				List<ImageChannel> imageChannels = imageData.getServer().getMetadata().getChannels();
+				if (ip instanceof ColorProcessor) {
+					for (int c = 0; c < 3; c++) {
+						String name = imageChannels.get(c).getName();
+						channels.put(name, ((ColorProcessor)ip).toFloat(c, null));
+					}
+				} else {
+					ImagePlus imp = pathImage.getImage();
+					for (int c = 1; c <= imp.getNChannels(); c++) {
+						String name = imageChannels.get(c-1).getName();
+						if (channels.containsKey(name))
+							logger.warn("Channel with duplicate name '{}' - will be skipped", name);
+						else
+							channels.put(name, imp.getStack().getProcessor(imp.getStackIndex(c, 0, 0)).convertToFloatProcessor());
+					}
+				}
+				// For fluorescence, measure everything
+				channelsCell.putAll(channels);
+
+				// Try to get detection channel for fluorescence
+				String detectionChannelName;
+				if (!isBrightfield) {
+					detectionChannelName = (String)params.getChoiceParameterValue("detectionImage");
+					fpDetection = channels.get(detectionChannelName);
+				}
+				else throw new IllegalArgumentException("No valid detection channel is selected!");
+			}
+			WatershedCellDetector detector2 = new WatershedCellDetector(fpDetection, channels, channelsCell, roi, pathImage);
+
+			// Convert parameters where needed
+			double backgroundRadius = params.getDoubleParameterValue("backgroundRadiusMicrons") / pixelSize;
+			double medianRadius = params.getDoubleParameterValue("medianRadiusMicrons") / pixelSize;
+			double sigma = params.getDoubleParameterValue("sigmaMicrons") / pixelSize;
+			double minArea = params.getDoubleParameterValue("minAreaMicrons") / (pixelSize * pixelSize);
+			double maxArea = params.getDoubleParameterValue("maxAreaMicrons") / (pixelSize * pixelSize);
+			double cellExpansion = params.getDoubleParameterValue("cellExpansionMicrons") / (pixelSize);
+
+			detector2.runDetection(
+					backgroundRadius,
+					isBrightfield ? params.getDoubleParameterValue("maxBackground") : Double.NEGATIVE_INFINITY,
+					medianRadius,
+					sigma,
+					params.getDoubleParameterValue("threshold"),
+					minArea,
+					maxArea,
+					true, // always use 'merge all' params.getBooleanParameterValue("mergeAll"),
+					params.getBooleanParameterValue("watershedPostProcess"),
+					params.getBooleanParameterValue("excludeDAB"),
+					cellExpansion,
+//					params.getBooleanParameterValue("limitExpansionByNucleusSize"),
+					params.getBooleanParameterValue("smoothBoundaries"),
+					params.getBooleanParameterValue("includeNuclei"),
+					params.getBooleanParameterValue("makeMeasurements"),
+					pathROI.getZ(),
+					pathROI.getT(),
+					params.getBooleanParameterValue("backgroundByReconstruction")
+					);// && isBrightfield);
+
+			List<PathObject> detections = detector2.getPathObjects();
+
+			// Apply intensity classifications
+			String measurement = (String)params.getChoiceParameterValue("thresholdCompartment");
+			double threshold1 = params.getDoubleParameterValue("thresholdPositive1");
+			double threshold2 = params.getDoubleParameterValue("thresholdPositive2");
+			double threshold3 = params.getDoubleParameterValue("thresholdPositive3");
+			boolean singleThreshold = params.getBooleanParameterValue("singleThreshold");
+			for (PathObject pathObject : detections) {
+				double val = pathObject.getMeasurementList().get(measurement);
+				if (singleThreshold) {
+					if (val >= threshold1) {
+						pathObject.setPathClass(PathClass.getPositive(pathObject.getPathClass()));
+					} else {
+						pathObject.setPathClass(PathClass.getNegative(pathObject.getPathClass()));
+					}
+				} else {
+					if (val >= threshold3) {
+						pathObject.setPathClass(PathClass.getThreePlus(pathObject.getPathClass()));
+					} else if (val >= threshold2){
+						pathObject.setPathClass(PathClass.getTwoPlus(pathObject.getPathClass()));
+					} else if (val >= threshold1){
+						pathObject.setPathClass(PathClass.getOnePlus(pathObject.getPathClass()));
+					} else
+						pathObject.setPathClass(PathClass.getNegative(pathObject.getPathClass()));
+				}
+			}
+
+			return detections;
 		}
 		
 	

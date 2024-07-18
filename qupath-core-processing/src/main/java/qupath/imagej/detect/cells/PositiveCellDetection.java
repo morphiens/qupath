@@ -124,6 +124,56 @@ public class PositiveCellDetection extends WatershedCellDetection {
 		ObjectDetector<BufferedImage> detector = super.createDetector(imageData, params);
 		return new DetectorWrapper<>(detector);
 	}
+
+
+	public static void addExraParams(ParameterList params, ImageData<BufferedImage> imageData) {
+		params.addTitleParameter("Intensity threshold parameters");
+		var stains = imageData.getColorDeconvolutionStains();
+		Set<String> channels = new LinkedHashSet<>();
+		if (stains != null) {
+			for (int i = 1; i <= 3; i++) {
+				var stain = stains.getStain(i);
+				if (!ColorDeconvolutionStains.isHematoxylin(stain) && !stain.isResidual())
+					channels.add(stain.getName() + " OD");
+			}
+		} else {
+			var server = imageData.getServer();
+			for (var channel : server.getMetadata().getChannels())
+				channels.add(channel.getName());
+		}
+		List<String> choices = new ArrayList<>();
+		for (var channel : channels) {
+			choices.add("Nucleus: " + channel + " mean");
+			choices.add("Nucleus: " + channel + " max");
+			choices.add("Cytoplasm: " + channel + " mean");
+			choices.add("Cytoplasm: " + channel + " max");
+			choices.add("Cell: " + channel + " mean");
+			choices.add("Cell: " + channel + " max");
+		}
+		var server = imageData.getServer();
+		var type = server.getMetadata().getPixelType();
+		// Determine appropriate starting thresholds & maxima
+		double t1 = 0.2;
+		double tMax = 1.5;
+		if (stains == null) {
+			if (!type.isFloatingPoint()) {
+				if (type.getBytesPerPixel() <= 1)
+					t1 = 10;
+				else
+					t1 = 100;
+				tMax = Math.min(10000, Math.pow(2, type.getBitsPerPixel()) - 1);
+			}
+		}
+		params.addChoiceParameter("thresholdCompartment", "Score compartment", choices.get(0), choices, "Select the intensity measurement to threshold");
+//			params.addChoiceParameter("thresholdCompartment", "Score compartment", "Nucleus: DAB OD mean",
+//					Arrays.asList("Nucleus: DAB OD mean", "Nucleus: DAB OD max",
+//							"Cytoplasm: DAB OD mean", "Cytoplasm: DAB OD max",
+//							"Cell: DAB OD mean", "Cell: DAB OD max"));
+		params.addDoubleParameter("thresholdPositive1", "Threshold 1+", t1, null, 0, tMax, "Low positive intensity threshold");
+		params.addDoubleParameter("thresholdPositive2", "Threshold 2+", t1*2, null, 0, tMax, "Moderate positive intensity threshold");
+		params.addDoubleParameter("thresholdPositive3", "Threshold 3+", t1*3, null, 0, tMax, "High positive intensity threshold");
+		params.addBooleanParameter("singleThreshold", "Single threshold", true);
+	}
 	
 	
 	
